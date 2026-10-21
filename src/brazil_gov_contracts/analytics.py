@@ -146,3 +146,88 @@ def buyer_concentration(con, as_of=None, signature_year=None, min_contracts=10,
       value_note='valorGlobal is a ceiling, not payments or company revenue. Positive finite ceilings only; outliers are retained and may distort ranking.',
       coverage_note='Installed PNCP snapshot, history starts in 2021; partial coverage is not total public/private revenue. Buyers are grouped by full CNPJ, suppliers by 8-digit legal-entity root. Thresholds apply after exclusions.',
       date_note='Future signatures excluded relative to as_of (default: current UTC date). signature_year uses actual signature year, not the PNCP partition/year. Quality exclusion categories can overlap; missing dates cannot be assigned to a signature year.')
+
+
+def cnae_new_entrants(con, cnae, as_of=None, entry_since='2026-01-01',
+                      definition='first_observed', limit=25):
+    """Current principal-CNAE cohort, with separate observed-entry/opening definitions."""
+    cnae=re.sub(r'[^0-9]','',cnae or '')
+    if len(cnae)!=7:raise ValueError('cnae must contain a seven-digit principal CNAE code.')
+    as_of=date.fromisoformat(as_of or datetime.now(timezone.utc).date().isoformat()).isoformat()
+    entry_since=date.fromisoformat(entry_since).isoformat()
+    if entry_since>as_of:raise ValueError('entry_since must not be later than as_of.')
+    if definition not in ('first_observed','newly_opened'):
+        raise ValueError('definition must be first_observed or newly_opened.')
+    limit=max(1,min(int(limit),100))
+    tables={r[0] for r in con.execute('SHOW TABLES').fetchall()}
+    out=dict(cnae=cnae,as_of=as_of,entry_since=entry_since,definition=definition,
+        label=('new to public contract data (observed history from 2021)' if definition=='first_observed'
+               else 'newly opened matriz with recorded public contracts in the entry period'),
+        coverage_note='Current September 2026 principal CNAE, not historical industry or secondary CNAEs. Sector membership means at least one recorded supplier establishment has this principal CNAE; first signature is checked across all establishments and sectors of its legal-entity root. First observed since 2021 is not first-ever contracting. Registry/partner files are supplier subsets; individuals and foreign/unmatched identifiers cannot be CNAE classified.',
+        opening_note='Company age uses only the matriz opening date when present; branch opening dates are never substituted. newly_opened requires a dated matriz in the requested opening period plus at least one contract signature in that period, and does not require absence of earlier contracts.',
+        partner_note='Registered partners/administrators, not ultimate owners. Missing partner rows mean unavailable in the installed subset, not no owners. Individual identifiers are masked. No risk or suspicion score.',
+        value_note='valorGlobal is a recorded ceiling, not payments or company revenue; sums use finite positive values only.')
+    if not {'registry','contracts'}<=tables:
+        out.update(available=False,count=0,rows=[],truncated=False);return out
+    out['available']=True
+    prefix="""WITH reg AS (
+      SELECT *,substr(cnpj,1,8) root,
+        try_strptime(data_inicio_atividade,'%Y%m%d')::DATE opened
+      FROM registry
+    ), sector AS (
+      SELECT root,min(razao_social) supplier_name,
+        list(DISTINCT cnpj ORDER BY cnpj) cnae_matching_establishments
+      FROM reg WHERE cnae_fiscal_principal=? GROUP BY root
+    ), matrix AS (
+      SELECT root,min(opened) FILTER(WHERE matriz_filial='1') matriz_opened
+      FROM reg GROUP BY root
+    ), signatures AS (
+      SELECT *,substr(niFornecedor,1,8) root,try_cast(dataAssinatura AS DATE) d
+      FROM contracts
+    ), history AS (
+      SELECT s.root,min(s.d) first_observed_signature,
+        count(*) FILTER(WHERE s.d BETWEEN ?::DATE AND ?::DATE) contracts_in_entry_period,
+        sum(CASE WHEN s.d BETWEEN ?::DATE AND ?::DATE AND isfinite(s.valorGlobal)
+            AND s.valorGlobal>0 THEN s.valorGlobal ELSE 0 END) period_ceiling_brl
+      FROM signatures s JOIN sector sec ON sec.root=s.root
+      WHERE regexp_full_match(s.niFornecedor,'[0-9]{14}') AND s.d<=?::DATE
+      GROUP BY s.root
+    ), cohort AS (
+      SELECT sec.*,m.matriz_opened,h.first_observed_signature,h.contracts_in_entry_period,
+        h.period_ceiling_brl
+      FROM sector sec JOIN history h USING(root) LEFT JOIN matrix m USING(root)
+      WHERE h.contracts_in_entry_period>0 AND
+        ((?='first_observed' AND h.first_observed_signature>=?::DATE)
+          OR (?='newly_opened' AND m.matriz_opened BETWEEN ?::DATE AND ?::DATE))
+    ) """
+    params=[cnae,entry_since,as_of,entry_since,as_of,as_of,
+            definition,entry_since,definition,entry_since,as_of]
+    rows=records(con,prefix+'SELECT * FROM cohort ORDER BY first_observed_signature,root LIMIT ?',params+[limit])
+    total=con.execute(prefix+'SELECT count(*) FROM cohort',params).fetchone()[0]
+    quality=records(con,prefix+"""SELECT
+      (SELECT count(*) FROM sector) sector_supplier_roots,
+      (SELECT count(*) FROM sector sec JOIN matrix m USING(root) WHERE m.matriz_opened IS NULL) sector_roots_missing_matriz_opening_date,
+      (SELECT count(*) FROM sector sec LEFT JOIN history h USING(root) WHERE h.root IS NULL) sector_roots_without_valid_observed_signature,
+      (SELECT count(*) FROM signatures WHERE d>?::DATE) future_signature_rows_dataset,
+      (SELECT count(*) FROM signatures WHERE d IS NULL) missing_or_invalid_signature_rows_dataset,
+      (SELECT count(*) FROM signatures WHERE NOT coalesce(regexp_full_match(niFornecedor,'[0-9]{14}'),false)) non_cnpj_supplier_rows_dataset,
+      (SELECT count(DISTINCT s.niFornecedor) FROM signatures s
+        LEFT JOIN registry r ON s.niFornecedor=r.cnpj
+        WHERE regexp_full_match(s.niFornecedor,'[0-9]{14}') AND r.cnpj IS NULL) supplier_cnpjs_without_registry,
+      (SELECT count(*) FROM registry WHERE coalesce(trim(cnae_fiscal_principal),'')='') registry_rows_missing_principal_cnae,
+      (SELECT count(*) FROM cohort) qualifying_supplier_roots
+    """,params+[as_of])[0]
+    for row in rows:
+        root=row.pop('root');row['supplier_root']=root
+        row['period_ceiling_brl']=round(row['period_ceiling_brl'],2)
+        # Count separately from returned rows so truncation never implies absence.
+        if 'partners' not in tables:
+            row['partners']=dict(available=False,count=0,truncated=False,rows=[])
+        else:
+            n=con.execute('SELECT count(*) FROM partners WHERE cnpj_root=?',[root]).fetchone()[0]
+            ps=records(con,'SELECT * FROM partners WHERE cnpj_root=? ORDER BY identificador_socio,nome_socio,cnpj_cpf_socio,data_entrada LIMIT 101',[root])
+            row['partners']=dict(available=bool(n),count=n,truncated=n>100,rows=ps[:100],
+                note='No rows means unavailable in this subset, not absence of partners.')
+    out.update(count=len(rows),qualifying_suppliers=total,truncated=total>limit,limit=limit,quality=quality,rows=rows,
+        date_note='Future/missing signatures are excluded. as_of defaults to UTC today. A backdated as_of still uses the current installed registry/partner snapshot, not historical ownership or CNAE.')
+    return out
