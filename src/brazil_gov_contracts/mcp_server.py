@@ -38,6 +38,23 @@ PARTNER_IDENTITY_NOTE = (
     "digits are partial. Partner data is personal data under LGPD."
 )
 
+SANCTION_SCOPE_NOTE = (
+    "Sanction scope and dates come from each CEIS/CNEP row (abrangencia, "
+    "orgao sancionador, start/end). Many sanctions apply only within the "
+    "sanctioning organ's sphere; a row is not automatically a universal ban, "
+    "and an expired or narrow sanction still appears here."
+)
+VALUE_CEILING_NOTE = (
+    "valorGlobal is the contract's ceiling value, not the amount actually paid."
+)
+WEAK_LINK_NOTE = (
+    "weak_link=true flags a partner key registered at 10 or more companies - a "
+    "pattern typical of professional intermediaries (accountants, nominee "
+    "administrators). Treat those links as weaker leads than low-degree keys."
+)
+WEAK_LINK_DEGREE = 10
+MAX_LINKED = 50
+
 _con = None
 mcp = FastMCP(
     "brazil-gov-contracts-mcp",
@@ -80,6 +97,11 @@ def _con_init():
     partners = os.path.join(DATA_DIR, "partners.parquet")
     if os.path.exists(partners):
         con.execute(f"CREATE VIEW partners AS SELECT * FROM read_parquet('{partners}')")
+    for name, fname in (("related_edges", "related_edges.parquet"),
+                        ("related_daily", "related_contracts_daily.parquet")):
+        p = os.path.join(DATA_DIR, fname)
+        if os.path.exists(p):
+            con.execute(f"CREATE VIEW {name} AS SELECT * FROM read_parquet('{p}')")
     _con = con
     return con
 
@@ -366,6 +388,286 @@ def sanctions_search(
         if cnpj and len(d14) == 14:
             out["match_scope"] = ENTITY_SCOPE_NOTE
         return out
+
+
+
+
+def _sanction_rows(con, root: str) -> dict:
+    """All CEIS/CNEP rows for an 8-digit root, with parsed window dates."""
+    out = {}
+    for cad in ("ceis", "cnep"):
+        rows, truncated = _rows(
+            con,
+            f"SELECT * FROM {cad} WHERE length(cnpj) = 14 AND substr(cnpj,1,8) = ?",
+            [root],
+            limit=MAX_ROWS,
+        )
+        out[cad] = {"count": len(rows), "truncated": truncated, "rows": rows}
+    return out
+
+
+def _windows(sanctions: dict):
+    """Union window [start, end-or-None] over all sanction rows; None start if no dated row."""
+    starts, ends = [], []
+    for cad in ("ceis", "cnep"):
+        for r in sanctions[cad]["rows"]:
+            d0 = r.get("data_inicio_sancao_iso")
+            d1 = r.get("data_final_sancao_iso")
+            if d0:
+                starts.append(str(d0)[:10])
+                ends.append(str(d1)[:10] if d1 else None)
+    if not starts:
+        return None, None
+    start = min(starts)
+    end = None if any(e is None for e in ends) else max(ends)
+    return start, end
+
+
+def _root_names(con, roots):
+    """razao_social per root from the registry (matriz record preferred)."""
+    names = {}
+    if "registry" not in _tables(con) or not roots:
+        return names
+    cur = con.execute(
+        "SELECT cnpj, razao_social FROM registry WHERE substr(cnpj,1,8) IN ("
+        + ",".join(["?"] * len(roots))
+        + ") ORDER BY (matriz_filial = 1) DESC, cnpj",
+        list(roots),
+    )
+    for cnpj, razao in cur.fetchall():
+        names.setdefault(cnpj[:8], razao)
+    return names
+
+
+@mcp.tool()
+def related_company_contracts_after_sanction(
+    ctx: Context,
+    cnpj: str | None = None,
+    scan: bool = False,
+    limit: int = 25,
+) -> dict:
+    """Companies that share a registered partner with a sanctioned company, and the
+    federal contracts they signed inside the sanction window. Company mode: pass
+    cnpj (14 digits, punctuation optional) for one sanctioned company - computed
+    on the fly. Scan mode: pass scan=true (no cnpj) for the ranked precomputed
+    scan across all CEIS/CNEP company rows. Partner links require the same partner
+    name AND the same masked CPF digits (or an exact CNPJ for corporate partners);
+    they are leads, not confirmed identities - read identity_note and weak_link."""
+    if not scan and not cnpj:
+        raise ValueError("Provide cnpj for company mode, or scan=true for the ranked precomputed scan.")
+    with log_tool("related_company_contracts_after_sanction", ctx):
+        con = _con_init()
+        if scan:
+            return _related_scan(con, limit)
+        return _related_company(con, _cnpj14(cnpj), limit)
+
+
+def _related_company(con, cnpj: str, limit: int) -> dict:
+    root = cnpj[:8]
+    result = {
+        "cnpj": cnpj,
+        "cnpj_root": root,
+        "mode": "company (computed on the fly)",
+        "identity_note": PARTNER_IDENTITY_NOTE,
+        "sanction_scope_note": SANCTION_SCOPE_NOTE,
+        "value_note": VALUE_CEILING_NOTE,
+        "weak_link_note": WEAK_LINK_NOTE,
+        "match_scope": ENTITY_SCOPE_NOTE,
+    }
+    if "partners" not in _tables(con):
+        result["present"] = False
+        return result
+    sanctions = _sanction_rows(con, root)
+    result["sanctions"] = sanctions
+    if sanctions["ceis"]["count"] == 0 and sanctions["cnep"]["count"] == 0:
+        result["sanctioned"] = False
+        result["linked_companies"] = []
+        return result
+    result["sanctioned"] = True
+    w_start, w_end = _windows(sanctions)
+    result["window"] = {
+        "start": w_start,
+        "end": w_end,
+        "note": "Union of all CEIS/CNEP windows for this entity; end=null means at least one sanction is open-ended.",
+    }
+    # partner keys of the sanctioned entity
+    keys = con.execute(
+        "SELECT DISTINCT identificador_socio, nome_socio, cnpj_cpf_socio, faixa_etaria "
+        "FROM partners WHERE cnpj_root = ? AND identificador_socio IN (1,2)",
+        [root],
+    ).fetchall()
+    result["partner_keys_used"] = len(keys)
+    if not keys or w_start is None:
+        result["linked_companies"] = []
+        result["linked_companies_note"] = (
+            "No partners in the 2026-09 release for this entity." if not keys
+            else "No dated sanction rows; window cannot be computed.")
+        return result
+    vals = ",".join(
+        f"({idf}, '{nm.replace(chr(39), chr(39)*2) if nm else ''}', '{cpf}')" for idf, nm, cpf, _ in keys
+    )
+    linked = con.execute(
+        f"""
+        WITH keys(idf, nome, cpf) AS (VALUES {vals})
+        SELECT k.idf, k.nome, k.cpf, p.cnpj_root, p.faixa_etaria,
+               (SELECT COUNT(DISTINCT p3.cnpj_root) FROM partners p3
+                WHERE p3.identificador_socio = k.idf AND p3.cnpj_cpf_socio = k.cpf
+                  AND (k.idf = 1 OR p3.nome_socio = k.nome)) AS key_degree
+        FROM keys k
+        JOIN partners p ON p.identificador_socio = k.idf AND p.cnpj_cpf_socio = k.cpf
+                       AND (k.idf = 1 OR p.nome_socio = k.nome)
+        WHERE p.cnpj_root <> '{root}'
+        """,
+    ).fetchall()
+    by_root = {}
+    for idf, nome, cpf, lroot, faixa, degree in linked:
+        e = by_root.setdefault(lroot, [])
+        e.append({
+            "edge_type": "pf_name_masked_cpf" if idf == 2 else "pj_exact_cnpj",
+            "nome_socio": nome if idf == 2 else None,
+            "cnpj_cpf_socio": cpf,
+            "faixa_etaria": faixa,
+            "key_degree": int(degree),
+            "weak_link": int(degree) >= WEAK_LINK_DEGREE,
+        })
+    all_roots = sorted(by_root)
+    truncated = len(all_roots) > MAX_LINKED
+    use_roots = all_roots[:MAX_LINKED]
+    result["linked_roots_found"] = len(all_roots)
+    result["linked_companies_truncated"] = truncated
+    if not use_roots:
+        result["linked_companies"] = []
+        return result
+    names = _root_names(con, use_roots)
+    # in-window contract aggregates (year partition pruning via w_start)
+    y0 = int(w_start[:4])
+    end_clause = "" if w_end is None else "AND c.dataAssinatura::DATE <= ?::DATE"
+    params = use_roots + [w_start] + ([] if w_end is None else [w_end])
+    agg = con.execute(
+        "SELECT substr(c.niFornecedor,1,8) AS r, COUNT(*) AS n, SUM(c.valorGlobal) AS v, "
+        "MIN(c.dataAssinatura) AS first_s, MAX(c.dataAssinatura) AS last_s "
+        "FROM contracts c WHERE substr(c.niFornecedor,1,8) IN ("
+        + ",".join(["?"] * len(use_roots)) + ") "
+        f"AND c.year >= {y0} AND c.dataAssinatura::DATE >= ?::DATE {end_clause} "
+        "GROUP BY 1",
+        params,
+    ).fetchall()
+    agg_map = {r: (int(n), v, f, l) for r, n, v, f, l in agg}
+    top = con.execute(
+        "SELECT r, numeroControlePNCP, orgaoRazaoSocial, uf, objetoContrato, valorGlobal, dataAssinatura FROM ("
+        "SELECT substr(c.niFornecedor,1,8) AS r, numeroControlePNCP, orgaoRazaoSocial, uf, "
+        "objetoContrato, valorGlobal, dataAssinatura, "
+        "ROW_NUMBER() OVER (PARTITION BY substr(c.niFornecedor,1,8) ORDER BY c.valorGlobal DESC NULLS LAST) AS rn "
+        "FROM contracts c WHERE substr(c.niFornecedor,1,8) IN ("
+        + ",".join(["?"] * len(use_roots)) + ") "
+        f"AND c.year >= {y0} AND c.dataAssinatura::DATE >= ?::DATE {end_clause}) "
+        "WHERE rn <= 5",
+        params,
+    ).fetchall()
+    top_map = {}
+    for r, *rest in top:
+        top_map.setdefault(r, []).append({
+            "numeroControlePNCP": rest[0], "orgaoRazaoSocial": rest[1], "uf": rest[2],
+            "objetoContrato": rest[3], "valorGlobal": rest[4], "dataAssinatura": rest[5],
+        })
+    companies = []
+    for lroot in use_roots:
+        n, v, f, l = agg_map.get(lroot, (0, None, None, None))
+        companies.append({
+            "cnpj_root": lroot,
+            "razao_social": names.get(lroot),
+            "matched_partners": by_root[lroot],
+            "contracts_in_window": {
+                "count": n,
+                "total_valor_global_brl": round(v, 2) if v is not None else None,
+                "first_signature": f,
+                "last_signature": l,
+            },
+            "top_contracts": top_map.get(lroot, []),
+        })
+    companies.sort(key=lambda c: (c["contracts_in_window"]["total_valor_global_brl"] or 0), reverse=True)
+    result["linked_companies"] = companies
+    result["linked_without_contracts_in_window"] = sum(1 for c in companies if c["contracts_in_window"]["count"] == 0)
+    return result
+
+
+def _related_scan(con, limit: int) -> dict:
+    out = {
+        "mode": "scan (precomputed across all current CEIS/CNEP company rows)",
+        "identity_note": PARTNER_IDENTITY_NOTE,
+        "sanction_scope_note": SANCTION_SCOPE_NOTE,
+        "value_note": VALUE_CEILING_NOTE,
+        "weak_link_note": WEAK_LINK_NOTE,
+        "match_scope": ENTITY_SCOPE_NOTE,
+    }
+    if "related_edges" not in _tables(con) or "related_daily" not in _tables(con):
+        out["present"] = False
+        out["note"] = "Precomputed related_edges / related_contracts_daily files are not installed on this server."
+        return out
+    out["present"] = True
+    rows = con.execute(
+        f"""
+        WITH sanc AS (
+          SELECT substr(cnpj,1,8) AS sanc_root,
+                 MIN(data_inicio_sancao_iso::DATE) AS d0,
+                 MAX(COALESCE(data_final_sancao_iso::DATE, DATE '2100-01-01')) AS d1,
+                 MIN(nome_do_sancionado) AS sanc_name,
+                 MIN(orgao_sancionador) AS orgao,
+                 MIN(abragencia_da_sancao) AS abrangencia,
+                 COUNT(*) AS sanction_rows
+          FROM (
+            SELECT cnpj, nome_do_sancionado, orgao_sancionador, abragencia_da_sancao,
+                   data_inicio_sancao_iso, data_final_sancao_iso FROM ceis WHERE length(cnpj)=14
+            UNION ALL
+            SELECT cnpj, nome_do_sancionado, orgao_sancionador, abragencia_da_sancao,
+                   data_inicio_sancao_iso, data_final_sancao_iso FROM cnep WHERE length(cnpj)=14
+          ) WHERE data_inicio_sancao_iso IS NOT NULL AND data_inicio_sancao_iso <> ''
+          GROUP BY 1
+        ),
+        agg AS (
+          SELECT e.sanc_root, e.linked_root,
+                 COUNT(DISTINCT e.cnpj_cpf_socio || coalesce(e.nome_socio,'')) AS shared_keys,
+                 MAX(e.key_degree) AS max_key_degree,
+                 list(DISTINCT e.edge_type) AS edge_types
+          FROM related_edges e GROUP BY 1,2
+        ),
+        vals AS (
+          SELECT a.sanc_root, a.linked_root, a.shared_keys, a.max_key_degree, a.edge_types,
+                 COUNT(*) AS n_days, SUM(d.n) AS n_contracts, SUM(d.v) AS total_v
+          FROM agg a
+          JOIN sanc s ON s.sanc_root = a.sanc_root
+          JOIN related_daily d ON d.cnpj_root = a.linked_root
+               AND d.day >= s.d0 AND d.day <= s.d1
+          GROUP BY 1,2,3,4,5
+        )
+        SELECT v.*, s.d0, s.d1, s.sanc_name, s.orgao, s.abrangencia, s.sanction_rows
+        FROM vals v JOIN sanc s ON s.sanc_root = v.sanc_root
+        WHERE v.n_contracts > 0
+        ORDER BY v.total_v DESC NULLS LAST
+        LIMIT {int(limit)}
+        """,
+    ).fetchall()
+    cols = ["sanc_root", "linked_root", "shared_keys", "max_key_degree", "edge_types",
+            "n_days", "n_contracts", "total_v", "window_start", "window_end",
+            "sanc_name", "orgao", "abrangencia", "sanction_rows"]
+    items = [dict(zip(cols, r)) for r in rows]
+    names = _root_names(con, [i["linked_root"] for i in items])
+    for i in items:
+        i["linked_razao_social"] = names.get(i["linked_root"])
+        i["total_valor_global_brl"] = round(i.pop("total_v"), 2) if i["total_v"] is not None else None
+        i["contracts_in_window"] = i.pop("n_contracts")
+        i["weak_link"] = (i["max_key_degree"] or 0) >= WEAK_LINK_DEGREE
+        i["window_end"] = None if str(i["window_end"]) == "2100-01-01" else str(i["window_end"])
+        i["window_start"] = str(i["window_start"])
+        i.pop("n_days", None)
+    totals = con.execute(
+        "SELECT COUNT(DISTINCT sanc_root), COUNT(DISTINCT linked_root), COUNT(*) FROM related_edges"
+    ).fetchone()
+    out["edges_total"] = {"sanctioned_roots": int(totals[0]), "linked_roots": int(totals[1]), "edges": int(totals[2])}
+    out["count"] = len(items)
+    out["limit"] = int(limit)
+    out["rows"] = items
+    return out
 
 
 def create_server() -> FastMCP:
