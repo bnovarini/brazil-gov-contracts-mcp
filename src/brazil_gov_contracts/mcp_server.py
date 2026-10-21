@@ -1100,6 +1100,35 @@ def related_company_funnel(
         out["rows"] = items[: max(1, min(int(limit), MAX_ROWS))]
         return out
 
+@mcp.tool()
+def supplier_partner_sanctions(cnpj: str, ctx: Context, limit: int = 25) -> dict:
+    """Reverse onboarding check, independent of contract wins: find sanctioned
+    companies sharing an individual or corporate registered partner with the
+    supplier. Shows dates, category, scope and organ per sanction. Exact name
+    plus masked CPF is a lead, not full identity. No match is not clearance;
+    the installed September 2026 partner subset is not all Brazilian companies.
+    Direct supplier sanctions are reported separately. No risk score."""
+    from .analytics import reverse_supplier_check
+    cnpj = _cnpj14(cnpj)
+    with log_tool("supplier_partner_sanctions", ctx):
+        return reverse_supplier_check(_con_init(), cnpj, limit)
+
+@mcp.tool()
+def supplier_buyer_concentration(ctx: Context, as_of: str | None = None,
+    signature_year: int | None = None, min_contracts: int = 10,
+    min_total_value: float = 1000000.0, limit: int = 25) -> dict:
+    """Rank suppliers by top public buyer share of recorded positive contract
+    ceilings, not revenue dependence. Buyers by full CNPJ, suppliers by root.
+    Minimum contract/value thresholds apply after excluding future/invalid
+    signatures, invalid identifiers and nonpositive values; exclusions reported.
+    signature_year means actual signature year, not PNCP publication year.
+    as_of defaults to today. No private-revenue or payment data is available."""
+    from .analytics import buyer_concentration
+    with log_tool("supplier_buyer_concentration", ctx):
+        return buyer_concentration(_con_init(), as_of, signature_year,
+                                   min_contracts, min_total_value, limit)
+
+
 def create_server() -> FastMCP:
     log_path = os.environ.get("USAGE_LOG")
     if log_path:
