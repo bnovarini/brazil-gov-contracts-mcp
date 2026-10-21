@@ -1129,6 +1129,22 @@ def supplier_buyer_concentration(ctx: Context, as_of: str | None = None,
                                    min_contracts, min_total_value, limit)
 
 
+@mcp.tool()
+def new_entrants_by_cnae(cnae: str, ctx: Context, as_of: str | None = None,
+    entry_since: str = "2026-01-01", definition: str = "first_observed",
+    limit: int = 25) -> dict:
+    """Principal-CNAE supplier cohort, partners where recorded, and entry dates.
+    Default first_observed: no valid recorded signature before entry_since,
+    at least one through as_of, labeled new to public contract data (history
+    from 2021), not first-ever contracting. newly_opened instead requires a
+    matriz opening date in the period and a recorded contract in the period.
+    Current CNAE/partner snapshot, not historical industry or ultimate owners.
+    Excludes future signatures and reports coverage gaps. No suspicion score."""
+    from .analytics import cnae_new_entrants
+    with log_tool("new_entrants_by_cnae", ctx):
+        return cnae_new_entrants(_con_init(), cnae, as_of, entry_since, definition, limit)
+
+
 def create_server() -> FastMCP:
     log_path = os.environ.get("USAGE_LOG")
     if log_path:
