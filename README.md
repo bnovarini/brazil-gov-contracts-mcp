@@ -2,7 +2,7 @@
 
 MCP server for due diligence on suppliers to the Brazilian federal government: one call returns a supplier's registry status, sanction history, federal contract history, and registered partners.
 
-Current release: v0.4.0. The hosted instance below runs this release.
+Current release: v0.5.0. The hosted instance below runs this release.
 
 ## Hosted MCP
 
@@ -52,6 +52,13 @@ Entity-level matching: contract and sanction results aggregate all establishment
 Example questions once connected:
 - "Run vendor due diligence on CNPJ 41.640.044/0001-63 - registry status, sanctions, partners, and their federal contract history."
 - "Did any company sharing a registered partner with this sanctioned supplier sign federal contracts after the sanction date?" A real anonymized pattern found with this tool: one partner appears in the registry of both a sanctioned company and a second, unrelated company that signed 6 federal contracts totaling R$17.4M after the sanction date.
+
+## Private v0.5.0 additions
+
+- `supplier_partner_sanctions(cnpj, limit=25)`: reverse supplier onboarding check. Looks directly in the installed partner and sanction files, without a contract requirement or a funnel exclusion. Individual matches require published name plus masked CPF; corporate matches require the same stored corporate identifier. Returns both sides of each partner link, separate direct supplier sanctions, complete sanction rows (dates, scope, category and organ), weak-key flags and explicit truncation. Foreign-partner rows without usable identifiers are not matched. The partner file is a supplier subset, not the full Brazilian registry. No match is not clearance. Registered administrators are not necessarily owners; no historical or ultimate ownership is inferred.
+- `supplier_buyer_concentration(as_of, signature_year, min_contracts=10, min_total_value=1000000, limit=25)`: dataset-wide ranking by top buyer share of positive finite recorded contract ceilings, not revenue dependence. Supplier establishments aggregate to legal-entity root; buyer identity uses full CNPJ. Thresholds apply after excluding future/invalid signatures, invalid identifiers and nonpositive/invalid values. Reports exclusion counts, qualifying suppliers and truncation. `signature_year` filters actual signature dates rather than publication-year partitions. `as_of` defaults to current UTC date. Ceiling outliers remain in the data and can distort ranks; no paid amounts or private-customer revenue is available. Query may take about 25 seconds on the existing resource size.
+
+No suspicion score. No new external service, paid feed, recurring refresh, or hosting resource. CNAE entrant analysis is feasibility-only and is not included in this build.
 
 ## Limits
 
